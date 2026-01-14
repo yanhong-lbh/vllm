@@ -99,41 +99,25 @@ from .utils import (
     make_layers,
     maybe_prefix,
 )
+import torch.nn.functional as F
 
 import triton
 
-# Set up Triton memory allocator for kernels that need scratch space
 def _triton_pytorch_allocator(size: int, alignment: int, stream: int) -> int:
     """Allocator that uses PyTorch to allocate memory for Triton kernels."""
     return torch.empty(size, dtype=torch.int8, device='cuda').data_ptr()
 
-# Set the allocator (newer Triton versions require this for kernels with scratch space)
 try:
     triton.set_allocator(_triton_pytorch_allocator)
 except Exception:
-    pass  # Allocator might already be set or not needed
+    pass
 
 logger = init_logger(__name__)
 
 
 def _l2_normalize(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
-    """
-    L2 normalize a tensor along the specified dimension.
-    
-    This is a PyTorch implementation that works with any dimension size,
-    unlike the Triton kernel which requires power-of-2 dimensions.
-    
-    Args:
-        x: Input tensor
-        dim: Dimension to normalize along
-        eps: Epsilon for numerical stability
-    
-    Returns:
-        L2 normalized tensor
-    """
-    norm = torch.norm(x, p=2, dim=dim, keepdim=True)
-    return x / (norm + eps)
-
+    inv_norm = torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
+    return x * inv_norm
 
 def _make_conv1d_weight_loader(dim: int, tp_size: int, tp_rank: int):
     """Create a weight loader for conv1d that handles sharding."""
@@ -217,7 +201,6 @@ class Olmo3_5HybridGatedDeltaNet(nn.Module, MambaBase):
             else 0
         )
 
-        # Input projections - separate Q, K, V projections like HF implementation
         self.q_proj = ColumnParallelLinear(
             input_size=self.hidden_size,
             output_size=self.key_dim,
@@ -240,7 +223,6 @@ class Olmo3_5HybridGatedDeltaNet(nn.Module, MambaBase):
             prefix=f"{prefix}.v_proj",
         )
 
-        # Gating projections
         self.a_proj = ColumnParallelLinear(
             input_size=self.hidden_size,
             output_size=self.num_heads,
@@ -265,9 +247,6 @@ class Olmo3_5HybridGatedDeltaNet(nn.Module, MambaBase):
                 prefix=f"{prefix}.g_proj",
             )
 
-        # Separate convolution layers for q, k, v (matching HF implementation)
-        # These are Conv1d with groups=hidden_size (depthwise)
-        # Shape: (hidden_size, 1, kernel_size)
         self.q_conv1d_weight = nn.Parameter(
             torch.empty(self.key_dim // self.tp_size, 1, self.conv_kernel_size)
         )
@@ -278,7 +257,6 @@ class Olmo3_5HybridGatedDeltaNet(nn.Module, MambaBase):
             torch.empty(self.value_dim // self.tp_size, 1, self.conv_kernel_size)
         )
 
-        # Set up weight loaders for the conv weights
         set_weight_attrs(
             self.q_conv1d_weight,
             {"weight_loader": _make_conv1d_weight_loader(self.key_dim, self.tp_size, self.tp_rank)}
@@ -292,7 +270,6 @@ class Olmo3_5HybridGatedDeltaNet(nn.Module, MambaBase):
             {"weight_loader": _make_conv1d_weight_loader(self.value_dim, self.tp_size, self.tp_rank)}
         )
 
-        # Time step projection parameters
         self.dt_bias = nn.Parameter(
             torch.ones(self.num_heads // self.tp_size),
         )
@@ -305,7 +282,7 @@ class Olmo3_5HybridGatedDeltaNet(nn.Module, MambaBase):
         set_weight_attrs(self.A_log, {"weight_loader": sharded_weight_loader(0)})
         set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
 
-        # Output normalization - use eps=1e-5 to match FLA's FusedRMSNormGated
+        # use eps=1e-5 to match FLA's FusedRMSNormGated
         o_norm_eps = 1e-5
         if self.use_gate:
             self.o_norm = RMSNormGated(
@@ -322,7 +299,6 @@ class Olmo3_5HybridGatedDeltaNet(nn.Module, MambaBase):
                 eps=o_norm_eps,
             )
 
-        # Output projection
         self.o_proj = RowParallelLinear(
             self.value_dim,
             self.hidden_size,
@@ -357,14 +333,22 @@ class Olmo3_5HybridGatedDeltaNet(nn.Module, MambaBase):
             ],
             dim=-1,
         )
-        query, key = map(
-            lambda x: rearrange(x, "l (h d) -> 1 l h d", d=self.head_k_dim),
-            (query, key),
-        )
-        value = rearrange(value, "l (h d) -> 1 l h d", d=self.head_v_dim)
         
-        # Apply L2 normalization to q and k here (using PyTorch, not Triton)
-        # This avoids the power-of-2 requirement in the FLA Triton kernels
+        num_kv_heads = self.num_kv_heads // self.tp_size
+        num_heads = self.num_heads // self.tp_size
+        
+        query = rearrange(query, "l (h d) -> 1 l h d", h=num_kv_heads, d=self.head_k_dim)
+        key = rearrange(key, "l (h d) -> 1 l h d", h=num_kv_heads, d=self.head_k_dim)
+        value = rearrange(value, "l (h d) -> 1 l h d", h=num_heads, d=self.head_v_dim)
+        
+        # GQA expansion if needed
+        if num_heads > num_kv_heads:
+            expand_ratio = num_heads // num_kv_heads
+            query = query.unsqueeze(3).expand(-1, -1, -1, expand_ratio, -1)
+            query = query.reshape(1, query.shape[1], num_heads, self.head_k_dim)
+            key = key.unsqueeze(3).expand(-1, -1, -1, expand_ratio, -1)
+            key = key.reshape(1, key.shape[1], num_heads, self.head_k_dim)
+        
         query = _l2_normalize(query, dim=-1)
         key = _l2_normalize(key, dim=-1)
         
@@ -375,12 +359,6 @@ class Olmo3_5HybridGatedDeltaNet(nn.Module, MambaBase):
         hidden_states: torch.Tensor,
         output: torch.Tensor,
     ):
-        """
-        Forward pass with three parts:
-        1. Input projection
-        2. Core attention (custom op)
-        3. Output projection
-        """
         num_tokens = hidden_states.size(0)
 
         # ============================================================
@@ -424,6 +402,7 @@ class Olmo3_5HybridGatedDeltaNet(nn.Module, MambaBase):
             gate = gate.view(num_tokens, self.num_heads // self.tp_size, self.head_v_dim)
             core_attn_out_flat = core_attn_out.reshape(-1, core_attn_out.shape[-1])
             gate_flat = gate.reshape(-1, gate.shape[-1])
+            gate_flat = F.silu(gate_flat)
             core_attn_out_normed = self.o_norm(core_attn_out_flat, gate_flat)
             core_attn_out = core_attn_out_normed.view(
                 num_tokens, self.num_heads // self.tp_size, self.head_v_dim
@@ -476,8 +455,6 @@ class Olmo3_5HybridGatedDeltaNet(nn.Module, MambaBase):
         b = b[:num_actual_tokens]
         a = a[:num_actual_tokens]
 
-        # 1. Convolution sequence transformation
-        # Combine conv weights for efficient processing
         conv_weights = self._get_combined_conv_weight()
 
         if spec_sequence_masks is not None:
@@ -491,7 +468,6 @@ class Olmo3_5HybridGatedDeltaNet(nn.Module, MambaBase):
             mixed_qkv_spec = None
             mixed_qkv_non_spec = mixed_qkv
 
-        # 1.1: Process the multi-query part
         if spec_sequence_masks is not None:
             mixed_qkv_spec = causal_conv1d_update(
                 mixed_qkv_spec,
@@ -508,13 +484,12 @@ class Olmo3_5HybridGatedDeltaNet(nn.Module, MambaBase):
                 validate_data=False,
             )
 
-        # 1.2: Process the remaining part
         if attn_metadata.num_prefills > 0:
             mixed_qkv_non_spec_T = mixed_qkv_non_spec.transpose(0, 1)
             mixed_qkv_non_spec = causal_conv1d_fn(
                 mixed_qkv_non_spec_T,
                 conv_weights,
-                None,  # no bias
+                None,
                 activation=self.activation,
                 conv_states=conv_state,
                 has_initial_state=has_initial_state,
@@ -527,7 +502,7 @@ class Olmo3_5HybridGatedDeltaNet(nn.Module, MambaBase):
                 mixed_qkv_non_spec,
                 conv_state,
                 conv_weights,
-                None,  # no bias
+                None,
                 self.activation,
                 conv_state_indices=non_spec_state_indices_tensor[
                     : attn_metadata.num_actual_tokens
@@ -563,9 +538,6 @@ class Olmo3_5HybridGatedDeltaNet(nn.Module, MambaBase):
             g_non_spec = g
             beta_non_spec = beta
 
-        # 2. Recurrent attention
-
-        # 2.1: Process the multi-query part
         if spec_sequence_masks is not None:
             core_attn_out_spec, last_recurrent_state = fused_recurrent_gated_delta_rule(
                 q=query_spec,
@@ -578,13 +550,11 @@ class Olmo3_5HybridGatedDeltaNet(nn.Module, MambaBase):
                 cu_seqlens=spec_query_start_loc[: attn_metadata.num_spec_decodes + 1],
                 ssm_state_indices=spec_state_indices_tensor,
                 num_accepted_tokens=num_accepted_tokens,
-                # L2 norm applied in rearrange_mixed_qkv to avoid Triton power-of-2 requirement
                 use_qk_l2norm_in_kernel=False,
             )
         else:
             core_attn_out_spec, last_recurrent_state = None, None
 
-        # 2.2: Process the remaining part
         if attn_metadata.num_prefills > 0:
             initial_state = ssm_state[non_spec_state_indices_tensor].contiguous()
             initial_state[~has_initial_state, ...] = 0
@@ -601,10 +571,8 @@ class Olmo3_5HybridGatedDeltaNet(nn.Module, MambaBase):
                 output_final_state=True,
                 cu_seqlens=non_spec_query_start_loc,
                 head_first=False,
-                # L2 norm applied in rearrange_mixed_qkv to avoid Triton power-of-2 requirement
                 use_qk_l2norm_in_kernel=False,
             )
-            # Init cache
             ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(
                 ssm_state.dtype
             )
@@ -622,14 +590,12 @@ class Olmo3_5HybridGatedDeltaNet(nn.Module, MambaBase):
                         : attn_metadata.num_decodes + 1
                     ],
                     ssm_state_indices=non_spec_state_indices_tensor,
-                    # L2 norm applied in rearrange_mixed_qkv to avoid Triton power-of-2 requirement
                     use_qk_l2norm_in_kernel=False,
                 )
             )
         else:
             core_attn_out_non_spec, last_recurrent_state = None, None
 
-        # 3. Merge core attention output
         if spec_sequence_masks is not None and core_attn_out_non_spec is not None:
             merged_out = torch.empty(
                 (1, num_actual_tokens, *core_attn_out_spec.shape[2:]),
@@ -646,11 +612,6 @@ class Olmo3_5HybridGatedDeltaNet(nn.Module, MambaBase):
 
 
 class Olmo3_5HybridAttention(nn.Module):
-    """
-    Attention layer for OLMo 3.5 Hybrid with QK norm.
-    Supports both full attention and sliding window attention.
-    """
-
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
@@ -677,7 +638,6 @@ class Olmo3_5HybridAttention(nn.Module):
         self.kv_size = self.num_kv_heads * self.head_dim
         self.max_position_embeddings = self.config.max_position_embeddings
 
-        # Attention input projection
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
             self.head_dim,
@@ -690,7 +650,6 @@ class Olmo3_5HybridAttention(nn.Module):
 
         self.tp_rank = get_tensor_model_parallel_rank()
         
-        # QK normalization
         self.k_norm = RMSNorm(
             self.total_num_kv_heads * self.head_dim,
             eps=self.config.rms_norm_eps,
@@ -720,7 +679,6 @@ class Olmo3_5HybridAttention(nn.Module):
             prefix=f"{prefix}.attn",
         )
 
-        # Rotary embeddings - use rope scaling only for full attention layers
         if sliding_window is None:
             rope_parameters = self.config.rope_parameters
         else:
@@ -733,7 +691,6 @@ class Olmo3_5HybridAttention(nn.Module):
             rope_parameters=rope_parameters,
         )
 
-        # Attention output projection
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
@@ -771,15 +728,12 @@ class Olmo3_5HybridAttention(nn.Module):
 
 
 class Olmo3_5HybridMLP(nn.Module):
-    """MLP block for OLMo 3.5 Hybrid."""
-
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         config = vllm_config.model_config.hf_config
         hidden_size = config.hidden_size
         intermediate_size = config.intermediate_size
 
-        # Feed-forward input projection
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
@@ -788,10 +742,8 @@ class Olmo3_5HybridMLP(nn.Module):
             prefix=f"{prefix}.gate_up_proj",
         )
 
-        # Activation function
         self.act_fn = SiluAndMul()
 
-        # Feed-forward output projection
         self.down_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
@@ -808,15 +760,6 @@ class Olmo3_5HybridMLP(nn.Module):
 
 
 class Olmo3_5HybridDecoderLayer(nn.Module):
-    """
-    Decoder layer for OLMo 3.5 Hybrid.
-    
-    Supports three layer types:
-    - full_attention: Standard attention with post-norm
-    - sliding_attention: Sliding window attention with post-norm
-    - linear_attention: Gated DeltaNet with pre-norm
-    """
-
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         config = vllm_config.model_config.hf_config
@@ -845,13 +788,11 @@ class Olmo3_5HybridDecoderLayer(nn.Module):
                 prefix=f"{prefix}.self_attn",
             )
 
-        # MLP block
         self.mlp = Olmo3_5HybridMLP(
             vllm_config=vllm_config,
             prefix=f"{prefix}.mlp",
         )
 
-        # LayerNorm
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
@@ -961,7 +902,6 @@ class Olmo3_5HybridModel(nn.Module):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
             ("qkv_proj", "v_proj", "v"),
@@ -969,7 +909,6 @@ class Olmo3_5HybridModel(nn.Module):
             ("gate_up_proj", "up_proj", 1),
         ]
         
-        # Mapping from HF conv1d names to vLLM parameter names
         conv_weight_mapping = {
             "q_conv1d.weight": "q_conv1d_weight",
             "k_conv1d.weight": "k_conv1d_weight",
@@ -983,18 +922,15 @@ class Olmo3_5HybridModel(nn.Module):
             if is_pp_missing_parameter(name, self):
                 continue
             
-            # Handle conv1d weight name mapping
             for hf_name, vllm_name in conv_weight_mapping.items():
                 if hf_name in name:
                     name = name.replace(hf_name, vllm_name)
                     break
             
-            # Handle stacked params for attention layers (not linear_attn)
             handled = False
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
-                # Skip stacking for linear attention layers - they have separate q/k/v
                 if "linear_attn" in name:
                     continue
                 name = name.replace(weight_name, param_name)
@@ -1021,14 +957,6 @@ class Olmo3_5HybridModel(nn.Module):
 
 
 class Olmo3_5HybridForCausalLM(nn.Module, HasInnerState, SupportsPP, SupportsLoRA, IsHybrid):
-    """
-    OLMo 3.5 Hybrid model for causal language modeling.
-    
-    This is a hybrid architecture that combines:
-    - Full attention layers
-    - Sliding window attention layers
-    - Gated DeltaNet linear attention layers
-    """
 
     packed_modules_mapping = {
         "qkv_proj": [
@@ -1134,9 +1062,6 @@ class Olmo3_5HybridForCausalLM(nn.Module, HasInnerState, SupportsPP, SupportsLoR
         return loader.load_weights(weights)
 
 
-# ============================================================
-# Custom Op and Triton Kernel for Gated DeltaNet
-# ============================================================
 
 def olmo3_5_hybrid_gdn_attention_core(
     mixed_qkv: torch.Tensor,
@@ -1145,10 +1070,6 @@ def olmo3_5_hybrid_gdn_attention_core(
     core_attn_out: torch.Tensor,
     layer_name: str,
 ) -> None:
-    """
-    Custom op for the core attention computation.
-    Only handles the convolution + recurrent attention part.
-    """
     forward_context: ForwardContext = get_forward_context()
     self = forward_context.no_compile_layers[layer_name]
     self._forward_core(
@@ -1229,12 +1150,6 @@ def fused_olmo3_5_hybrid_gdn_gating(
     beta: float = 1.0,
     threshold: float = 20.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Fused computation of g and beta for OLMo 3.5 Hybrid Gated Delta Net.
-    
-    g = -A_log.float().exp() * F.softplus(a.float() + dt_bias)
-    beta_output = b.sigmoid() * (2.0 if allow_neg_eigval else 1.0)
-    """
     batch, num_heads = a.shape
     seq_len = 1
     grid = (batch, seq_len, triton.cdiv(num_heads, 8))
