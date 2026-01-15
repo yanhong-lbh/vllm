@@ -99,7 +99,6 @@ from .utils import (
     make_layers,
     maybe_prefix,
 )
-import torch.nn.functional as F
 
 import triton
 
@@ -402,7 +401,6 @@ class Olmo3_5HybridGatedDeltaNet(nn.Module, MambaBase):
             gate = gate.view(num_tokens, self.num_heads // self.tp_size, self.head_v_dim)
             core_attn_out_flat = core_attn_out.reshape(-1, core_attn_out.shape[-1])
             gate_flat = gate.reshape(-1, gate.shape[-1])
-            gate_flat = F.silu(gate_flat)
             core_attn_out_normed = self.o_norm(core_attn_out_flat, gate_flat)
             core_attn_out = core_attn_out_normed.view(
                 num_tokens, self.num_heads // self.tp_size, self.head_v_dim
