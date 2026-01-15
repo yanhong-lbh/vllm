@@ -496,17 +496,24 @@ class Olmo3_5HybridGatedDeltaNet(nn.Module, MambaBase):
                 metadata=attn_metadata,
             ).transpose(0, 1)
         elif attn_metadata.num_decodes > 0:
-            mixed_qkv_non_spec = causal_conv1d_update(
-                mixed_qkv_non_spec,
-                conv_state,
-                conv_weights,
-                None,
-                self.activation,
-                conv_state_indices=non_spec_state_indices_tensor[
-                    : attn_metadata.num_actual_tokens
-                ],
-                validate_data=True,
-            )
+            # Check if this is actually a first token (no prior state)
+            # In this case, conv output should be zeros like HF
+            if has_initial_state is None or (has_initial_state is not None and not has_initial_state.any()):
+                # First token of new sequence - conv output should be zeros
+                mixed_qkv_non_spec = torch.zeros_like(mixed_qkv_non_spec)
+            else:
+                # Normal decode with prior state
+                mixed_qkv_non_spec = causal_conv1d_update(
+                    mixed_qkv_non_spec,
+                    conv_state,
+                    conv_weights,
+                    None,
+                    self.activation,
+                    conv_state_indices=non_spec_state_indices_tensor[
+                        : attn_metadata.num_actual_tokens
+                    ],
+                    validate_data=True,
+                )
         else:
             mixed_qkv_non_spec = None
 
