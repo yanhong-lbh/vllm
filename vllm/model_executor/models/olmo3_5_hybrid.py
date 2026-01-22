@@ -677,17 +677,24 @@ class Olmo3_5HybridAttention(nn.Module):
             prefix=f"{prefix}.attn",
         )
 
-        if sliding_window is None:
-            rope_parameters = self.config.rope_parameters
-        else:
-            rope_theta = self.config.rope_parameters["rope_theta"]
-            rope_parameters = {"rope_type": "default", "rope_theta": rope_theta}
+        # Check if RoPE is used (drope models have rope_theta=None)
+        rope_theta = getattr(self.config, 'rope_theta', None)
+        self._use_rope = rope_theta is not None
         
-        self.rotary_emb = get_rope(
-            self.head_dim,
-            max_position=self.max_position_embeddings,
-            rope_parameters=rope_parameters,
-        )
+        if self._use_rope:
+            if sliding_window is None:
+                rope_parameters = self.config.rope_parameters
+            else:
+                rope_theta = self.config.rope_parameters["rope_theta"]
+                rope_parameters = {"rope_type": "default", "rope_theta": rope_theta}
+            
+            self.rotary_emb = get_rope(
+                self.head_dim,
+                max_position=self.max_position_embeddings,
+                rope_parameters=rope_parameters,
+            )
+        else:
+            self.rotary_emb = None
 
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
@@ -719,7 +726,8 @@ class Olmo3_5HybridAttention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self._apply_qk_norm(q, k)
-        q, k = self.rotary_emb(positions, q, k)
+        if self._use_rope and self.rotary_emb is not None:
+            q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
         return output
