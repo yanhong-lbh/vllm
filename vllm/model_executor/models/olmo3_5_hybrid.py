@@ -694,7 +694,8 @@ class Olmo3_5HybridAttention(nn.Module):
         print("😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄")
         print(rope_parameters)
         print("😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄")
-        self._use_rope = rope_parameters["rope_theta"] is not None
+        
+        self._use_rope = (rope_parameters is not None) and (rope_parameters["rope_theta"] is not None)
 
         if self._use_rope:
             self.rotary_emb = get_rope(
