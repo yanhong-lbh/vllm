@@ -694,7 +694,7 @@ class Olmo3_5HybridAttention(nn.Module):
         print("😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄")
         print(rope_parameters)
         print("😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄")
-        
+
         self._use_rope = (rope_parameters is not None) and (rope_parameters["rope_theta"] is not None)
 
         if self._use_rope:
@@ -798,11 +798,11 @@ class Olmo3_5HybridDecoderLayer(nn.Module):
                 prefix=f"{prefix}.linear_attn",
             )
             # FLA layers use these norm names
-            self.post_attention_layernorm = RMSNorm(
+            self.attention_layer_norm = RMSNorm(
                 config.hidden_size,
                 eps=config.rms_norm_eps,
             )
-            self.post_feedforward_layernorm = RMSNorm(
+            self.feedforward_layer_norm = RMSNorm(
                 config.hidden_size,
                 eps=config.rms_norm_eps,
             )
@@ -833,7 +833,7 @@ class Olmo3_5HybridDecoderLayer(nn.Module):
     ) -> torch.Tensor:
         if self.layer_type == "linear_attention":
             residual = hidden_states
-            hidden_states = self.post_attention_layernorm(hidden_states)
+            hidden_states = self.attention_layer_norm(hidden_states)
 
             attn_output = torch.empty_like(hidden_states)
             self.linear_attn(
@@ -843,7 +843,7 @@ class Olmo3_5HybridDecoderLayer(nn.Module):
             hidden_states = residual + attn_output
 
             residual = hidden_states
-            hidden_states = self.post_feedforward_layernorm(hidden_states)
+            hidden_states = self.feedforward_layer_norm(hidden_states)
             hidden_states = self.mlp(hidden_states)
             hidden_states = residual + hidden_states
         else:
