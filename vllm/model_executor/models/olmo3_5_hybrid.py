@@ -691,6 +691,9 @@ class Olmo3_5HybridAttention(nn.Module):
         )
 
         rope_parameters = getattr(self.config, "rope_parameters", None)
+        print("😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄")
+        print(rope_parameters)
+        print("😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄😄")
         self._use_rope = rope_parameters is not None
 
         if self._use_rope:
